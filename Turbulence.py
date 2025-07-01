@@ -21,6 +21,8 @@ class Turbulence:
     TURB_SCRATCH_MACH_INDEX = 5
     TURB_SCRATCH_SIZE = TURB_SCRATCH_MACH_INDEX + 1
 
+    MIN_CELLS_PER_TURB_KERNEL = 30
+
     def __init__(self, ad, turb_fwhm_factor=5):
         '''
         ad: yt cut_region() object containing the data for the region/phase of interest.
@@ -131,35 +133,49 @@ class Turbulence:
         turb_kernel_indices = self.tree.query_ball_point(cell_location, turb_r)
         end = len(turb_kernel_indices)
 
-        self.x_scratch[:end] = self.x[turb_kernel_indices]
-        self.y_scratch[:end] = self.y[turb_kernel_indices]
-        self.z_scratch[:end] = self.z[turb_kernel_indices]
-        self.dx_scratch[:end] = self.dx[turb_kernel_indices]
+        if end > Turbulence.MIN_CELLS_PER_TURB_KERNEL:
+            self.x_scratch[:end] = self.x[turb_kernel_indices]
+            self.y_scratch[:end] = self.y[turb_kernel_indices]
+            self.z_scratch[:end] = self.z[turb_kernel_indices]
+            self.dx_scratch[:end] = self.dx[turb_kernel_indices]
 
-        self.turb_kernel_num_cells_monitor[index] = end
-        self.turb_kernel_radius_monitor[index] = turb_r
-        self.mean_cell_length_monitor[index] = np.mean(self.dx_scratch[:end])
-        self.std_cell_length_monitor[index] = np.std(self.dx_scratch[:end])
+            self.turb_kernel_num_cells_monitor[index] = end
+            self.turb_kernel_radius_monitor[index] = turb_r
+            self.mean_cell_length_monitor[index] = np.mean(self.dx_scratch[:end])
+            self.std_cell_length_monitor[index] = np.std(self.dx_scratch[:end])
 
-        self.fill_smooth_scratch(turb_kernel_indices, turb_fwhm / 2)
-        self.fill_turb_scratch(turb_kernel_indices, end)
-        
-        sl = np.s_[0:end]
-        numba_get_rho_by_rho0(self.turb_scratch[Turbulence.LN_RHO_INDEX, sl], self.turb_scratch[Turbulence.TURB_SCRATCH_RHO_INDEX, sl])
-        numba_get_mach(self.turb_scratch[Turbulence.TURB_SCRATCH_VEL_X_INDEX, sl], self.turb_scratch[Turbulence.TURB_SCRATCH_VEL_Y_INDEX, sl], 
-                       self.turb_scratch[Turbulence.TURB_SCRATCH_VEL_Z_INDEX, sl], self.dataset[Turbulence.CS_INDEX, turb_kernel_indices], 
-                       self.turb_scratch[Turbulence.TURB_SCRATCH_MACH_INDEX, sl])        
+            self.fill_smooth_scratch(turb_kernel_indices, turb_fwhm / 2)
+            self.fill_turb_scratch(turb_kernel_indices, end)
+            
+            sl = np.s_[0:end]
+            numba_get_rho_by_rho0(self.turb_scratch[Turbulence.LN_RHO_INDEX, sl], self.turb_scratch[Turbulence.TURB_SCRATCH_RHO_INDEX, sl])
+            numba_get_mach(self.turb_scratch[Turbulence.TURB_SCRATCH_VEL_X_INDEX, sl], self.turb_scratch[Turbulence.TURB_SCRATCH_VEL_Y_INDEX, sl], 
+                        self.turb_scratch[Turbulence.TURB_SCRATCH_VEL_Z_INDEX, sl], self.dataset[Turbulence.CS_INDEX, turb_kernel_indices], 
+                        self.turb_scratch[Turbulence.TURB_SCRATCH_MACH_INDEX, sl])        
 
-        self.fill_gaussian_kernel_scratch(index, turb_kernel_indices, end, turb_fwhm)
+            self.fill_gaussian_kernel_scratch(index, turb_kernel_indices, end, turb_fwhm)
 
-        self.center_weight_x_monitor[index] = self.x_scratch[:end].dot(self.kernel_scratch[:end])
-        self.center_weight_y_monitor[index] = self.y_scratch[:end].dot(self.kernel_scratch[:end])
-        self.center_weight_z_monitor[index] = self.z_scratch[:end].dot(self.kernel_scratch[:end])
+            self.center_weight_x_monitor[index] = self.x_scratch[:end].dot(self.kernel_scratch[:end])
+            self.center_weight_y_monitor[index] = self.y_scratch[:end].dot(self.kernel_scratch[:end])
+            self.center_weight_z_monitor[index] = self.z_scratch[:end].dot(self.kernel_scratch[:end])
 
-        dens_disp = self.get_weighted_std(end, self.turb_scratch[Turbulence.TURB_SCRATCH_RHO_INDEX])
-        rms_turb_mach = self.get_weighted_std(end, self.turb_scratch[Turbulence.TURB_SCRATCH_MACH_INDEX])
+            dens_disp = self.get_weighted_std(end, self.turb_scratch[Turbulence.TURB_SCRATCH_RHO_INDEX])
+            rms_turb_mach = self.get_weighted_std(end, self.turb_scratch[Turbulence.TURB_SCRATCH_MACH_INDEX])
 
-        b = dens_disp / rms_turb_mach
+            b = dens_disp / rms_turb_mach
+
+        else:
+            dens_disp = np.nan
+            rms_turb_mach = np.nan
+            b = np.nan
+            self.turb_kernel_num_cells_monitor[index] = end
+            self.turb_kernel_radius_monitor[index] = np.nan
+            self.mean_cell_length_monitor[index] = np.nan
+            self.std_cell_length_monitor[index] = np.nan
+            self.center_weight_x_monitor[index] = np.nan
+            self.center_weight_y_monitor[index] = np.nan
+            self.center_weight_z_monitor[index] = np.nan
+
         return dens_disp, rms_turb_mach, b
     
     def fill_turbulence_maps(self):
