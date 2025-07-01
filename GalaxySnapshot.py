@@ -7,7 +7,7 @@ from prettytable import PrettyTable
 from util import create_movie
 
 class GalaxySnapshot:
-    SCALE_HEIGHT_FACTOR = 3
+    SCALE_HEIGHT_FACTOR = 50
     def __init__(self, path, outdir=None):
         self.path = path
         self.outdir = outdir
