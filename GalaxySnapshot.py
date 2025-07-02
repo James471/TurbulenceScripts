@@ -385,10 +385,18 @@ class GalaxySnapshot:
         p_disc.annotate_title("Disc Phase Plot")
         p_disc.save(os.path.join(self.outdir, "phase_plot_disc.pdf"))
 
-    def get_phase_fraction(self, criteria, name="phase", mass_fraction=0.9):
-        galaxy_criteria = self.get_disc_criteria(mass_fraction)
-        ad_galaxy = self.ad.cut_region(galaxy_criteria)
-        ad_galaxy_phase = self.ad.cut_region(criteria + galaxy_criteria)
+    def get_ad_galaxy_phase(self, disc_phase_criteria):
+        ad_phase = self.ad.cut_region(disc_phase_criteria)
+        return ad_phase
+
+    def get_ad_galaxy(self, disc_criteria):
+        ad_galaxy = self.ad.cut_region(disc_criteria)
+        return ad_galaxy
+
+    def get_phase_info(self, phase_criteria, disc_criteria, name="phase"):
+        disc_phase_criteria = disc_criteria + phase_criteria
+        ad_galaxy = self.get_ad_galaxy(disc_phase_criteria)
+        ad_galaxy_phase = self.get_ad_galaxy_phase(disc_phase_criteria)
         galaxy_volume = ad_galaxy["cell_volume"].sum().to("kpc**3")
         galaxy_resolution_elements = ad_galaxy["cell_volume"].size
         phase_volume = ad_galaxy_phase["cell_volume"].sum().to("kpc**3")
@@ -407,11 +415,17 @@ class GalaxySnapshot:
         for level in range(self.get_max_level() + 1):
             num_cells = (ad_galaxy_phase[("index", "grid_level")] == level).sum()
             info[f"{name}_fraction_per_level"][level] = num_cells / phase_resolution_elements
-        return info, ad_galaxy_phase
-    
-    def plot_phase_projection(self, criteria, name="phase", mass_fraction=0.9):
-        phase_info, ad_galaxy_phase = self.get_phase_fraction(criteria, name, mass_fraction)
-        ad_full_phase = self.ad.cut_region(criteria)
+        return info
+
+    def get_phase_fraction(self, phase_criteria, name="phase", mass_fraction=0.9):
+        disc_criteria = self.get_disc_criteria(mass_fraction)
+        phase_info = self.get_phase_info(phase_criteria, disc_criteria, name)
+        ad_galaxy_phase = self.get_ad_galaxy_phase(disc_criteria + phase_criteria)
+        return phase_info, ad_galaxy_phase
+
+    def plot_phase_projection(self, phase_criteria, name="phase", mass_fraction=0.9):
+        phase_info, ad_galaxy_phase = self.get_phase_fraction(phase_criteria, name, mass_fraction)
+        ad_full_phase = self.ad.cut_region(phase_criteria)
 
         x_galaxy = ad_galaxy_phase["x"]
         y_galaxy = ad_galaxy_phase["y"]
