@@ -4,6 +4,8 @@ from util import numba_unstructured_gaussian_kernel, numba_weighted_std, numba_g
 from mpi4py import MPI
 from tqdm import tqdm
 
+import time
+
 class Turbulence:
     RHO_INDEX = 0
     LN_RHO_INDEX = 1
@@ -23,40 +25,87 @@ class Turbulence:
 
     MIN_CELLS_PER_TURB_KERNEL = 30
 
+    fill_smooth_scratch_time = 0
+    fill_turb_scratch_time = 0
+    numba_get_rho_by_rho0_time = 0
+    fill_gaussian_kernel_scratch_time = 0
+
+    turb_sc_calc_time = 0
+    fill_gaussian_kernel_scratch_2_time = 0
+    query_ball_time = 0
+
+    def update_load_balanced_order(self):
+        if self.comm is None or self.size == 1:
+            self.load_balanced_order = np.ones(self._ad["x"].shape[0], dtype=np.int32)
+            return
+        x = self._ad["x"].to(self.length_unit).value
+        y = self._ad["y"].to(self.length_unit).value
+        z = self._ad["z"].to(self.length_unit).value
+        dx = self._ad["dx"].to(self.length_unit).value
+        dy = self._ad["dy"].to(self.length_unit).value
+        dz = self._ad["dz"].to(self.length_unit).value
+        positions = np.array([x, y, z]).T
+        tree = KDTree(positions)
+        neighbor_lists = tree.query_ball_point(positions, 1.3 * self.turb_fwhm_factor * np.sqrt(dx**2 + dy**2 + dz**2))
+        neighbor_counts = np.array([len(neighbors) for neighbors in neighbor_lists])
+        items = list(enumerate(neighbor_counts))
+        items.sort(key=lambda x: -x[1])
+        N = len(neighbor_counts)
+        P = self.size
+        bins = [[] for _ in range(P)]
+        loads = np.zeros(P, dtype=np.int32)
+        for (idx, count) in items:
+            i = np.argmin(loads)
+            bins[i].append(idx)
+            loads[i] += count
+        self.load_balanced_order = np.concatenate(bins)
+
+    def get_data(self, key, unit):
+        if not hasattr(self, "load_balanced_order"):
+            self.update_load_balanced_order()
+        return self._ad[key].to(unit).value[self.load_balanced_order]
+
     def __init__(self, ad, turb_fwhm_factor=5):
         '''
         ad: yt cut_region() object containing the data for the region/phase of interest.
         turb_fwhm_factor: FWHM of the roving kernel is turb_fwhm_factor * sqrt(dx^2 + dy^2 + dz^2).
         '''
+        self._ad = ad
+        try:
+            self.comm = MPI.COMM_WORLD
+            self.rank = self.comm.Get_rank()
+            self.size = self.comm.Get_size()
+        except NameError:
+            self.comm = None
+            self.rank = 0
+            self.size = 1
 
-        self.ad = ad
+        self.length_unit = self._ad.ds.quan(1, "pc")
+        self.rho_unit = self._ad.ds.quan(1, "g/cm**3")
+        self.vel_unit = self._ad.ds.quan(1, "km/s")
 
-        self.length_unit = ad.ds.quan(1, "pc")
-        self.rho_unit = ad.ds.quan(1, "g/cm**3")
-        self.vel_unit = ad.ds.quan(1, "km/s")
+        self.turb_fwhm_factor = turb_fwhm_factor
 
-        self.x = ad["x"].to(self.length_unit).value
-        self.y = ad["y"].to(self.length_unit).value
-        self.z = ad["z"].to(self.length_unit).value
-        self.dx = ad["dx"].to(self.length_unit).value
-        self.dy = ad["dy"].to(self.length_unit).value
-        self.dz = ad["dz"].to(self.length_unit).value
-        self.volume = ad["cell_volume"].to(self.length_unit**3).value
+        self.x = self.get_data("x", self.length_unit)
+        self.y = self.get_data("y", self.length_unit)
+        self.z = self.get_data("z", self.length_unit)
+        self.dx = self.get_data("dx", self.length_unit)
+        self.dy = self.get_data("dy", self.length_unit)
+        self.dz = self.get_data("dz", self.length_unit)
+        self.volume = self.get_data("cell_volume", self.length_unit**3)
 
         self.num_cells = self.x.shape[0]
 
         self.dataset = np.zeros((Turbulence.DATASET_SIZE, self.num_cells))
-        self.dataset[Turbulence.RHO_INDEX] = ad["density"].to(self.rho_unit).value
+        self.dataset[Turbulence.RHO_INDEX] = self.get_data("density", self.rho_unit)
         self.dataset[Turbulence.LN_RHO_INDEX] = np.log(self.dataset[Turbulence.RHO_INDEX])
-        self.dataset[Turbulence.VEL_X_INDEX] = ad["velocity_x"].to(self.vel_unit).value
-        self.dataset[Turbulence.VEL_Y_INDEX] = ad["velocity_y"].to(self.vel_unit).value
-        self.dataset[Turbulence.VEL_Z_INDEX] = ad["velocity_z"].to(self.vel_unit).value
-        self.dataset[Turbulence.CS_INDEX] = ad["sound_speed"].to(self.vel_unit).value
+        self.dataset[Turbulence.VEL_X_INDEX] = self.get_data("velocity_x", self.vel_unit)
+        self.dataset[Turbulence.VEL_Y_INDEX] = self.get_data("velocity_y", self.vel_unit)
+        self.dataset[Turbulence.VEL_Z_INDEX] = self.get_data("velocity_z", self.vel_unit)
+        self.dataset[Turbulence.CS_INDEX] = self.get_data("sound_speed", self.vel_unit)
 
         self.positions = np.array([self.x, self.y, self.z]).T
         self.tree = KDTree(self.positions)
-
-        self.turb_fwhm_factor = turb_fwhm_factor
 
         self.dens_disp = np.zeros(self.positions.shape[0])
         self.rms_turb_mach = np.zeros(self.positions.shape[0])
@@ -86,15 +135,6 @@ class Turbulence:
         self.z_scratch = np.zeros(self.num_cells)
         self.dx_scratch = np.zeros(self.num_cells)
 
-        try:
-            self.comm = MPI.COMM_WORLD
-            self.rank = self.comm.Get_rank()
-            self.size = self.comm.Get_size()
-        except NameError:
-            self.comm = None
-            self.rank = 0
-            self.size = 1
-
     def fill_gaussian_kernel_scratch(self, center_index, kernel_indices, end, fwhm):
         numba_unstructured_gaussian_kernel(self.positions[kernel_indices], self.positions[center_index], 
                                            self.volume[kernel_indices], fwhm, self.kernel_scratch[:end])
@@ -107,11 +147,17 @@ class Turbulence:
             smooth_kernel_indices = all_smooth_kernel_indices[i]  
             end = len(smooth_kernel_indices)
 
+            start_t = time.time()
             self.fill_gaussian_kernel_scratch(center_index, smooth_kernel_indices, end, fwhm)
+            end_t = time.time()
+            Turbulence.fill_gaussian_kernel_scratch_2_time += end_t - start_t
 
+            start_t = time.time()
             self.turb_scratch[Turbulence.LN_RHO_INDEX][i], self.turb_scratch[Turbulence.TURB_SCRATCH_VEL_X_INDEX][i], \
                 self.turb_scratch[Turbulence.TURB_SCRATCH_VEL_Y_INDEX][i], self.turb_scratch[Turbulence.TURB_SCRATCH_VEL_Z_INDEX][i] = \
                     self.dataset[Turbulence.LN_RHO_INDEX:Turbulence.VEL_Z_INDEX+1, smooth_kernel_indices].dot(self.kernel_scratch[:end])
+            end_t = time.time()
+            Turbulence.turb_sc_calc_time += end_t - start_t
 
     def fill_turb_scratch(self, kernel_indices, end):
         dataset_slice = np.s_[Turbulence.LN_RHO_INDEX:Turbulence.VEL_Z_INDEX+1]
@@ -144,16 +190,28 @@ class Turbulence:
             self.mean_cell_length_monitor[index] = np.mean(self.dx_scratch[:end])
             self.std_cell_length_monitor[index] = np.std(self.dx_scratch[:end])
 
+            st = time.time()
             self.fill_smooth_scratch(turb_kernel_indices, turb_fwhm / 2)
+            et = time.time()
+            Turbulence.fill_smooth_scratch_time += et - st
+            st = time.time()
             self.fill_turb_scratch(turb_kernel_indices, end)
+            et = time.time()
+            Turbulence.fill_turb_scratch_time += et - st
             
             sl = np.s_[0:end]
+            st = time.time()
             numba_get_rho_by_rho0(self.turb_scratch[Turbulence.LN_RHO_INDEX, sl], self.turb_scratch[Turbulence.TURB_SCRATCH_RHO_INDEX, sl])
             numba_get_mach(self.turb_scratch[Turbulence.TURB_SCRATCH_VEL_X_INDEX, sl], self.turb_scratch[Turbulence.TURB_SCRATCH_VEL_Y_INDEX, sl], 
                         self.turb_scratch[Turbulence.TURB_SCRATCH_VEL_Z_INDEX, sl], self.dataset[Turbulence.CS_INDEX, turb_kernel_indices], 
                         self.turb_scratch[Turbulence.TURB_SCRATCH_MACH_INDEX, sl])        
+            et = time.time()
+            Turbulence.numba_get_rho_by_rho0_time += et - st
 
+            st = time.time()
             self.fill_gaussian_kernel_scratch(index, turb_kernel_indices, end, turb_fwhm)
+            et = time.time()
+            Turbulence.fill_gaussian_kernel_scratch_time += et - st
 
             self.center_weight_x_monitor[index] = self.x_scratch[:end].dot(self.kernel_scratch[:end])
             self.center_weight_y_monitor[index] = self.y_scratch[:end].dot(self.kernel_scratch[:end])
@@ -184,11 +242,19 @@ class Turbulence:
         start = self.rank * cells_per_proc
         end = (self.rank + 1) * cells_per_proc if self.rank < self.size - 1 else num_cells
         print(f"Rank {self.rank} processing cells {start} to {end}")
+        start_t = time.time()
         for i in tqdm(range(start, end), desc=f"Rank {self.rank}", position=self.rank):
         # for i in range(start, end):
             self.dens_disp[i], self.rms_turb_mach[i], self.b[i] = self.get_turbulence_params(i)
+            # perc_finished = (i - start) / (end - start) * 100
             # if (i - start) % 100 == 0:
-            #     print(f"Finished processing cell {i} on rank {self.rank}")
+            #     print(f"Rank {self.rank}: {perc_finished:.2f}% finished")
+        end_t = time.time()
+        print(f"Rank {self.rank} finished processing cells {start} to {end} in {(end_t - start_t)/60:.2f} minutes")
+
+        print(f"Rank {self.rank} smooth scratch fill time: {Turbulence.fill_smooth_scratch_time:.2f} seconds")
+        print(f"Rank {self.rank} turbulence scratch calculation time: {Turbulence.turb_sc_calc_time:.2f} seconds")
+        print(f"Rank {self.rank} fill gaussian kernel scratch 2 time: {Turbulence.fill_gaussian_kernel_scratch_2_time:.2f} seconds")
 
         if self.comm is not None and self.size > 1:
             if self.rank == 0:
