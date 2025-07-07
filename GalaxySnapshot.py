@@ -218,8 +218,10 @@ class GalaxySnapshot:
 
         z_mid = com_z
         vertical_distance = z_cord - z_mid
-
-        popt, cor = curve_fit(log_scale_height_model, vertical_distance.to('kpc').value, np.log(rho), p0=[rho.max().value, 0.1])
+        nan_mask = np.isfinite((np.log(rho)))
+        rho_clean = rho[nan_mask]
+        vertical_distance_clean = vertical_distance[nan_mask]
+        popt, cor = curve_fit(log_scale_height_model, vertical_distance_clean.to('kpc').value, np.log(rho_clean), p0=[rho_clean.max().value, 0.1])
 
         z0, sigma_z0 = popt[1], np.sqrt(cor[1][1])
 
@@ -261,7 +263,7 @@ class GalaxySnapshot:
     def create_gas_plot(self, dataset, proj_dir, savefile, zoom=1, annotate_COM=False, unit=None):
         if proj_dir not in ["x", "y", "z"]:
             raise NotImplementedError("Projection direction must be 'x', 'y', or 'z'")
-        plot = yt.ProjectionPlot(self.ds, proj_dir, dataset)
+        plot = yt.ProjectionPlot(self.ds, proj_dir, dataset, weight_field="ones")
         if unit is not None:
             plot.set_unit(dataset, unit)
         plot.zoom(zoom)
@@ -353,7 +355,7 @@ class GalaxySnapshot:
 
     def plot_gas_disc(self, mass_fraction=0.9):
         R, z0 = self.locate_gas_disc(mass_fraction)
-        p = yt.ProjectionPlot(self.ds, 'z', 'density')
+        p = yt.ProjectionPlot(self.ds, 'z', 'density', weight_field="ones")
         com_gas = self.get_gas_COM()
         p.annotate_marker(com_gas, marker="x", coord_system='data', s=15)
         p.annotate_sphere(com_gas, R, coord_system='data')
@@ -395,7 +397,7 @@ class GalaxySnapshot:
 
     def get_phase_info(self, phase_criteria, disc_criteria, name="phase"):
         disc_phase_criteria = disc_criteria + phase_criteria
-        ad_galaxy = self.get_ad_galaxy(disc_phase_criteria)
+        ad_galaxy = self.get_ad_galaxy(disc_criteria)
         ad_galaxy_phase = self.get_ad_galaxy_phase(disc_phase_criteria)
         galaxy_volume = ad_galaxy["cell_volume"].sum().to("kpc**3")
         galaxy_resolution_elements = ad_galaxy["cell_volume"].size
@@ -431,9 +433,12 @@ class GalaxySnapshot:
         y_galaxy = ad_galaxy_phase["y"]
         z_galaxy = ad_galaxy_phase["z"]
         width_galaxy = ((x_galaxy.max() - x_galaxy.min()).to("code_length"), (y_galaxy.max() - y_galaxy.min()).to("code_length"), (z_galaxy.max() - z_galaxy.min()).to("code_length"))
-        p_x = yt.ProjectionPlot(self.ds, 'z', ('gas', 'density'), data_source=ad_galaxy_phase, width=width_galaxy)
-        p_y = yt.ProjectionPlot(self.ds, 'x', ('gas', 'density'), data_source=ad_galaxy_phase, width=width_galaxy)
-        p_z = yt.ProjectionPlot(self.ds, 'y', ('gas', 'density'), data_source=ad_galaxy_phase, width=width_galaxy)
+        p_x = yt.ProjectionPlot(self.ds, 'z', ('gas', 'density'), data_source=ad_galaxy_phase, width=width_galaxy, weight_field="ones")
+        p_y = yt.ProjectionPlot(self.ds, 'x', ('gas', 'density'), data_source=ad_galaxy_phase, width=width_galaxy, weight_field="ones")
+        p_z = yt.ProjectionPlot(self.ds, 'y', ('gas', 'density'), data_source=ad_galaxy_phase, width=width_galaxy, weight_field="ones")
+        p_x.set_axes_unit('kpc')
+        p_y.set_axes_unit('kpc')
+        p_z.set_axes_unit('kpc')
         p_x.save(os.path.join(self.outdir, f"{name}_projection_x_sch_{GalaxySnapshot.SCALE_HEIGHT_FACTOR}.pdf"))
         p_y.save(os.path.join(self.outdir, f"{name}_projection_y_sch_{GalaxySnapshot.SCALE_HEIGHT_FACTOR}.pdf"))
         p_z.save(os.path.join(self.outdir, f"{name}_projection_z_sch_{GalaxySnapshot.SCALE_HEIGHT_FACTOR}.pdf"))
@@ -442,9 +447,12 @@ class GalaxySnapshot:
         y_full = ad_full_phase["y"]
         z_full = ad_full_phase["z"]
         width_full = ((x_full.max() - x_full.min()).to("code_length"), (y_full.max() - y_full.min()).to("code_length"), (z_full.max() - z_full.min()).to("code_length"))
-        p_x_full = yt.ProjectionPlot(self.ds, 'z', ('gas', 'density'), data_source=ad_full_phase, width=width_full)
-        p_y_full = yt.ProjectionPlot(self.ds, 'x', ('gas', 'density'), data_source=ad_full_phase, width=width_full)
-        p_z_full = yt.ProjectionPlot(self.ds, 'y', ('gas', 'density'), data_source=ad_full_phase, width=width_full)
+        p_x_full = yt.ProjectionPlot(self.ds, 'z', ('gas', 'density'), data_source=ad_full_phase, width=width_full, weight_field="ones")
+        p_y_full = yt.ProjectionPlot(self.ds, 'x', ('gas', 'density'), data_source=ad_full_phase, width=width_full, weight_field="ones")
+        p_z_full = yt.ProjectionPlot(self.ds, 'y', ('gas', 'density'), data_source=ad_full_phase, width=width_full, weight_field="ones")
+        p_x_full.set_axes_unit('kpc')
+        p_y_full.set_axes_unit('kpc')
+        p_z_full.set_axes_unit('kpc')
         p_x_full.save(os.path.join(self.outdir, f"{name}_projection_x_full.pdf"))
         p_y_full.save(os.path.join(self.outdir, f"{name}_projection_y_full.pdf"))
         p_z_full.save(os.path.join(self.outdir, f"{name}_projection_z_full.pdf"))
