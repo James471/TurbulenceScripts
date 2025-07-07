@@ -25,12 +25,6 @@ class Turbulence:
 
     MIN_CELLS_PER_TURB_KERNEL = 30
 
-    fill_smooth_scratch_time = 0
-    turb_sc_calc_time = 0
-    fill_gaussian_kernel_scratch_2_time = 0
-    query_ball_time = 0
-    size_calc_time = 0
-
     def update_load_balanced_order(self):
         if self.comm is None or self.size == 1:
             self.load_balanced_order = np.arange(self._ad["x"].shape[0])
@@ -137,30 +131,18 @@ class Turbulence:
                                            self.volume[kernel_indices], fwhm, self.kernel_scratch[:end])
 
     def fill_smooth_scratch(self, turb_kernel_indices, fwhm):
-        start_t = time.time()
         r = 1.3 * fwhm
         all_smooth_kernel_indices = self.tree.query_ball_point(self.positions[turb_kernel_indices], r, return_sorted=False)
-        end_t = time.time()
-        Turbulence.query_ball_time += end_t - start_t
+        ln_rho_to_vel_z_slice = np.s_[Turbulence.LN_RHO_INDEX:Turbulence.VEL_Z_INDEX+1]
         for i in range(len(turb_kernel_indices)):
-            start_t = time.time()
             center_index = turb_kernel_indices[i] 
             smooth_kernel_indices = all_smooth_kernel_indices[i]  
             end = len(smooth_kernel_indices)
-            end_t = time.time()
-            Turbulence.size_calc_time += end_t - start_t
 
-            start_t = time.time()
             self.fill_gaussian_kernel_scratch(center_index, smooth_kernel_indices, end, fwhm)
-            end_t = time.time()
-            Turbulence.fill_gaussian_kernel_scratch_2_time += end_t - start_t
 
-            start_t = time.time()
-            self.turb_scratch[Turbulence.LN_RHO_INDEX][i], self.turb_scratch[Turbulence.TURB_SCRATCH_VEL_X_INDEX][i], \
-                self.turb_scratch[Turbulence.TURB_SCRATCH_VEL_Y_INDEX][i], self.turb_scratch[Turbulence.TURB_SCRATCH_VEL_Z_INDEX][i] = \
-                    self.dataset[Turbulence.LN_RHO_INDEX:Turbulence.VEL_Z_INDEX+1, smooth_kernel_indices].dot(self.kernel_scratch[:end])
-            end_t = time.time()
-            Turbulence.turb_sc_calc_time += end_t - start_t
+            np.einsum('ij,j->i', self.dataset[ln_rho_to_vel_z_slice, smooth_kernel_indices],
+                      self.kernel_scratch[:end], out=self.turb_scratch[ln_rho_to_vel_z_slice, i])
 
     def fill_turb_scratch(self, kernel_indices, end):
         dataset_slice = np.s_[Turbulence.LN_RHO_INDEX:Turbulence.VEL_Z_INDEX+1]
@@ -193,10 +175,7 @@ class Turbulence:
             self.mean_cell_length_monitor[index] = np.mean(self.dx_scratch[:end])
             self.std_cell_length_monitor[index] = np.std(self.dx_scratch[:end])
 
-            st = time.time()
             self.fill_smooth_scratch(turb_kernel_indices, turb_fwhm / 2)
-            et = time.time()
-            Turbulence.fill_smooth_scratch_time += et - st
 
             self.fill_turb_scratch(turb_kernel_indices, end)
             
@@ -242,12 +221,6 @@ class Turbulence:
             self.dens_disp[i], self.rms_turb_mach[i], self.b[i] = self.get_turbulence_params(i)
         end_t = time.time()
         print(f"Rank {self.rank} finished processing cells {start} to {end} in {(end_t - start_t)/60:.2f} minutes")
-
-        print(f"Rank {self.rank} smooth scratch fill time: {Turbulence.fill_smooth_scratch_time:.2f} seconds")
-        print(f"Rank {self.rank} turbulence scratch calculation time: {Turbulence.turb_sc_calc_time:.2f} seconds")
-        print(f"Rank {self.rank} fill gaussian kernel scratch 2 time: {Turbulence.fill_gaussian_kernel_scratch_2_time:.2f} seconds")
-        print(f"Rank {self.rank} query ball time: {Turbulence.query_ball_time:.2f} seconds")
-        print(f"Rank {self.rank} size calculation time: {Turbulence.size_calc_time:.2f} seconds")
 
         if self.comm is not None and self.size > 1:
             if self.rank == 0:
