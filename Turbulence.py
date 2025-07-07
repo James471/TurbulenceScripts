@@ -26,17 +26,14 @@ class Turbulence:
     MIN_CELLS_PER_TURB_KERNEL = 30
 
     fill_smooth_scratch_time = 0
-    fill_turb_scratch_time = 0
-    numba_get_rho_by_rho0_time = 0
-    fill_gaussian_kernel_scratch_time = 0
-
     turb_sc_calc_time = 0
     fill_gaussian_kernel_scratch_2_time = 0
     query_ball_time = 0
+    size_calc_time = 0
 
     def update_load_balanced_order(self):
         if self.comm is None or self.size == 1:
-            self.load_balanced_order = np.ones(self._ad["x"].shape[0], dtype=np.int32)
+            self.load_balanced_order = None
             return
         x = self._ad["x"].to(self.length_unit).value
         y = self._ad["y"].to(self.length_unit).value
@@ -140,12 +137,18 @@ class Turbulence:
                                            self.volume[kernel_indices], fwhm, self.kernel_scratch[:end])
 
     def fill_smooth_scratch(self, turb_kernel_indices, fwhm):
+        start_t = time.time()
         r = 1.3 * fwhm
         all_smooth_kernel_indices = self.tree.query_ball_point(self.positions[turb_kernel_indices], r, return_sorted=False)
+        end_t = time.time()
+        Turbulence.query_ball_time += end_t - start_t
         for i in range(len(turb_kernel_indices)):
+            start_t = time.time()
             center_index = turb_kernel_indices[i] 
             smooth_kernel_indices = all_smooth_kernel_indices[i]  
             end = len(smooth_kernel_indices)
+            end_t = time.time()
+            Turbulence.size_calc_time += end_t - start_t
 
             start_t = time.time()
             self.fill_gaussian_kernel_scratch(center_index, smooth_kernel_indices, end, fwhm)
@@ -194,24 +197,16 @@ class Turbulence:
             self.fill_smooth_scratch(turb_kernel_indices, turb_fwhm / 2)
             et = time.time()
             Turbulence.fill_smooth_scratch_time += et - st
-            st = time.time()
+
             self.fill_turb_scratch(turb_kernel_indices, end)
-            et = time.time()
-            Turbulence.fill_turb_scratch_time += et - st
             
             sl = np.s_[0:end]
-            st = time.time()
             numba_get_rho_by_rho0(self.turb_scratch[Turbulence.LN_RHO_INDEX, sl], self.turb_scratch[Turbulence.TURB_SCRATCH_RHO_INDEX, sl])
             numba_get_mach(self.turb_scratch[Turbulence.TURB_SCRATCH_VEL_X_INDEX, sl], self.turb_scratch[Turbulence.TURB_SCRATCH_VEL_Y_INDEX, sl], 
                         self.turb_scratch[Turbulence.TURB_SCRATCH_VEL_Z_INDEX, sl], self.dataset[Turbulence.CS_INDEX, turb_kernel_indices], 
                         self.turb_scratch[Turbulence.TURB_SCRATCH_MACH_INDEX, sl])        
-            et = time.time()
-            Turbulence.numba_get_rho_by_rho0_time += et - st
 
-            st = time.time()
             self.fill_gaussian_kernel_scratch(index, turb_kernel_indices, end, turb_fwhm)
-            et = time.time()
-            Turbulence.fill_gaussian_kernel_scratch_time += et - st
 
             self.center_weight_x_monitor[index] = self.x_scratch[:end].dot(self.kernel_scratch[:end])
             self.center_weight_y_monitor[index] = self.y_scratch[:end].dot(self.kernel_scratch[:end])
@@ -244,17 +239,15 @@ class Turbulence:
         print(f"Rank {self.rank} processing cells {start} to {end}")
         start_t = time.time()
         for i in tqdm(range(start, end), desc=f"Rank {self.rank}", position=self.rank):
-        # for i in range(start, end):
             self.dens_disp[i], self.rms_turb_mach[i], self.b[i] = self.get_turbulence_params(i)
-            # perc_finished = (i - start) / (end - start) * 100
-            # if (i - start) % 100 == 0:
-            #     print(f"Rank {self.rank}: {perc_finished:.2f}% finished")
         end_t = time.time()
         print(f"Rank {self.rank} finished processing cells {start} to {end} in {(end_t - start_t)/60:.2f} minutes")
 
         print(f"Rank {self.rank} smooth scratch fill time: {Turbulence.fill_smooth_scratch_time:.2f} seconds")
         print(f"Rank {self.rank} turbulence scratch calculation time: {Turbulence.turb_sc_calc_time:.2f} seconds")
         print(f"Rank {self.rank} fill gaussian kernel scratch 2 time: {Turbulence.fill_gaussian_kernel_scratch_2_time:.2f} seconds")
+        print(f"Rank {self.rank} query ball time: {Turbulence.query_ball_time:.2f} seconds")
+        print(f"Rank {self.rank} size calculation time: {Turbulence.size_calc_time:.2f} seconds")
 
         if self.comm is not None and self.size > 1:
             if self.rank == 0:
