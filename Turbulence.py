@@ -15,6 +15,15 @@ class Turbulence:
     CS_INDEX = 5
     DATASET_SIZE = CS_INDEX + 1
 
+    X_INDEX = 0
+    Y_INDEX = 1
+    Z_INDEX = 2
+    DX_INDEX = 3
+    DY_INDEX = 4
+    DZ_INDEX = 5
+    VOLUME_INDEX = 6
+    SHARED_LOC_SIZE = VOLUME_INDEX + 1
+
     TURB_SCRATCH_RHO_INDEX = 0
     TURB_SCRATCH_LN_RHO_INDEX = 1
     TURB_SCRATCH_VEL_X_INDEX = 2
@@ -56,75 +65,151 @@ class Turbulence:
             self.update_load_balanced_order()
         return self._ad[key].to(unit).value[self.load_balanced_order]
 
+    def update_max_scratch_size(self):
+        self.scratch_size = 0
+        for i in range(self.start, self.end):
+            dx, dy, dz = self.dx[i], self.dy[i], self.dz[i]
+            turb_fwhm = self.turb_fwhm_factor * np.sqrt(dx**2 + dy**2 + dz**2)
+            turb_r = 1.3 * turb_fwhm
+            turb_kernel_indices = self.tree.query_ball_point(self.positions[i], turb_r)
+            end = len(turb_kernel_indices)
+            if end > self.scratch_size:
+                self.scratch_size = end
+        self.scratch_size *= 10  # Fingers crossed
+        self.scratch_size = min(self.scratch_size, self._ad["x"].shape[0])
+
     def __init__(self, ad, turb_fwhm_factor=5):
         '''
         ad: yt cut_region() object containing the data for the region/phase of interest.
         turb_fwhm_factor: FWHM of the roving kernel is turb_fwhm_factor * sqrt(dx^2 + dy^2 + dz^2).
         '''
         self._ad = ad
-        try:
-            self.comm = MPI.COMM_WORLD
-            self.rank = self.comm.Get_rank()
-            self.size = self.comm.Get_size()
-        except NameError:
-            self.comm = None
-            self.rank = 0
-            self.size = 1
-
         self.length_unit = self._ad.ds.quan(1, "pc")
         self.rho_unit = self._ad.ds.quan(1, "g/cm**3")
         self.vel_unit = self._ad.ds.quan(1, "km/s")
-
         self.turb_fwhm_factor = turb_fwhm_factor
+        try:
+            self.comm = MPI.COMM_WORLD
+            self.shmcomm = self.comm.Split_type(MPI.COMM_TYPE_SHARED)
+            self.rank = self.comm.Get_rank()
+            self.size = self.comm.Get_size()
 
-        self.x = self.get_data("x", self.length_unit)
-        self.y = self.get_data("y", self.length_unit)
-        self.z = self.get_data("z", self.length_unit)
-        self.dx = self.get_data("dx", self.length_unit)
-        self.dy = self.get_data("dy", self.length_unit)
-        self.dz = self.get_data("dz", self.length_unit)
-        self.volume = self.get_data("cell_volume", self.length_unit**3)
+            N = self.get_data("x", self.length_unit).shape[0]
+            itemsize = np.dtype(np.float64).itemsize
+            win_dataset = MPI.Win.Allocate_shared(self.DATASET_SIZE * N * itemsize if self.rank == 0 else 0, itemsize, MPI.INFO_NULL, self.shmcomm)
+            win_loc = MPI.Win.Allocate_shared(self.SHARED_LOC_SIZE * N * itemsize if self.rank == 0 else 0, itemsize, MPI.INFO_NULL, self.shmcomm)
+            win_pos = MPI.Win.Allocate_shared(3 * N * itemsize if self.rank == 0 else 0, itemsize, MPI.INFO_NULL, self.shmcomm)
+            self.shmcomm.Barrier()
+            buf_dataset, _ = win_dataset.Shared_query(0)
+            buf_loc, _ = win_loc.Shared_query(0)
+            buf_pos, _ = win_pos.Shared_query(0)
+            shared_dataset = np.ndarray((self.DATASET_SIZE, N), dtype=np.float64, buffer=buf_dataset)
+            shared_loc = np.ndarray((self.SHARED_LOC_SIZE, N), dtype=np.float64, buffer=buf_loc)
+            shared_pos = np.ndarray((N , 3), dtype=np.float64, buffer=buf_pos)
 
-        self.num_cells = self.x.shape[0]
+        except NameError:
+            self.comm = None
+            self.shmcomm = None
+            self.rank = 0
+            self.size = 1
+            N = self._ad["x"].shape[0]
+            shared_dataset = np.zeros((self.DATASET_SIZE, N), dtype=np.float64)
+            shared_loc = np.zeros((self.SHARED_LOC_SIZE, N), dtype=np.float64)
+            shared_pos = np.zeros((N, 3), dtype=np.float64)
 
-        self.dataset = np.zeros((Turbulence.DATASET_SIZE, self.num_cells))
-        self.dataset[Turbulence.RHO_INDEX] = self.get_data("density", self.rho_unit)
-        self.dataset[Turbulence.LN_RHO_INDEX] = np.log(self.dataset[Turbulence.RHO_INDEX])
-        self.dataset[Turbulence.VEL_X_INDEX] = self.get_data("velocity_x", self.vel_unit)
-        self.dataset[Turbulence.VEL_Y_INDEX] = self.get_data("velocity_y", self.vel_unit)
-        self.dataset[Turbulence.VEL_Z_INDEX] = self.get_data("velocity_z", self.vel_unit)
-        self.dataset[Turbulence.CS_INDEX] = self.get_data("sound_speed", self.vel_unit)
+        if self.rank == 0:
+            shared_loc[Turbulence.X_INDEX] = self.get_data("x", self.length_unit)
+            shared_loc[Turbulence.Y_INDEX] = self.get_data("y", self.length_unit)
+            shared_loc[Turbulence.Z_INDEX] = self.get_data("z", self.length_unit)
+            shared_loc[Turbulence.DX_INDEX] = self.get_data("dx", self.length_unit)
+            shared_loc[Turbulence.DY_INDEX] = self.get_data("dy", self.length_unit)
+            shared_loc[Turbulence.DZ_INDEX] = self.get_data("dz", self.length_unit)
+            shared_loc[Turbulence.VOLUME_INDEX] = self.get_data("cell_volume", self.length_unit**3)
 
-        self.positions = np.array([self.x, self.y, self.z]).T
+            shared_dataset[Turbulence.RHO_INDEX] = self.get_data("density", self.rho_unit)
+            shared_dataset[Turbulence.LN_RHO_INDEX] = np.log(shared_dataset[Turbulence.RHO_INDEX])
+            shared_dataset[Turbulence.VEL_X_INDEX] = self.get_data("velocity_x", self.vel_unit)
+            shared_dataset[Turbulence.VEL_Y_INDEX] = self.get_data("velocity_y", self.vel_unit)
+            shared_dataset[Turbulence.VEL_Z_INDEX] = self.get_data("velocity_z", self.vel_unit)
+            shared_dataset[Turbulence.CS_INDEX] = self.get_data("sound_speed", self.vel_unit)
+
+            shared_pos[:, 0] = shared_loc[Turbulence.X_INDEX]
+            shared_pos[:, 1] = shared_loc[Turbulence.Y_INDEX]
+            shared_pos[:, 2] = shared_loc[Turbulence.Z_INDEX]
+
+        self.shmcomm.Barrier()
+
+        self.x = shared_loc[Turbulence.X_INDEX]
+        self.y = shared_loc[Turbulence.Y_INDEX]
+        self.z = shared_loc[Turbulence.Z_INDEX]
+        self.dx = shared_loc[Turbulence.DX_INDEX]
+        self.dy = shared_loc[Turbulence.DY_INDEX]
+        self.dz = shared_loc[Turbulence.DZ_INDEX]
+        self.volume = shared_loc[Turbulence.VOLUME_INDEX]
+
+        self.positions = shared_pos
         self.tree = KDTree(self.positions)
 
-        self.dens_disp = np.zeros(self.positions.shape[0])
-        self.rms_turb_mach = np.zeros(self.positions.shape[0])
-        self.b = np.zeros(self.positions.shape[0])
+        self.dataset = shared_dataset
 
-        self.turb_scratch = np.zeros((Turbulence.TURB_SCRATCH_SIZE, self.num_cells))
-        self.turb_scratch[Turbulence.TURB_SCRATCH_RHO_INDEX] = np.zeros(self.num_cells)
-        self.turb_scratch[Turbulence.TURB_SCRATCH_LN_RHO_INDEX] = np.zeros(self.num_cells)
-        self.turb_scratch[Turbulence.TURB_SCRATCH_VEL_X_INDEX] = np.zeros(self.num_cells)
-        self.turb_scratch[Turbulence.TURB_SCRATCH_VEL_Y_INDEX] = np.zeros(self.num_cells)
-        self.turb_scratch[Turbulence.TURB_SCRATCH_VEL_Z_INDEX] = np.zeros(self.num_cells)
-        self.turb_scratch[Turbulence.TURB_SCRATCH_MACH_INDEX] = np.zeros(self.num_cells)
+        self.num_cells = self.x.shape[0]
+        self.cells_per_proc = self.num_cells // self.size
+        self.start = self.rank * self.cells_per_proc
+        self.end = (self.rank + 1) * self.cells_per_proc if self.rank < self.size - 1 else self.num_cells
+        self.num_cells_processing = self.end - self.start
 
-        self.kernel_scratch = np.zeros(self.positions.shape[0])
-        self.distance_scratch = np.zeros((self.positions.shape[0], 3))
+        self.update_max_scratch_size()
 
-        self.mean_cell_length_monitor = np.zeros(self.num_cells)
-        self.std_cell_length_monitor = np.zeros(self.num_cells)
-        self.turb_kernel_num_cells_monitor = np.zeros(self.num_cells)
-        self.turb_kernel_radius_monitor = np.zeros(self.num_cells)
-        self.center_weight_x_monitor = np.zeros(self.num_cells)
-        self.center_weight_y_monitor = np.zeros(self.num_cells)
-        self.center_weight_z_monitor = np.zeros(self.num_cells)
+        self.dens_disp = np.zeros(self.num_cells_processing)
+        self.rms_turb_mach = np.zeros(self.num_cells_processing)
+        self.b = np.zeros(self.num_cells_processing)
 
-        self.x_scratch = np.zeros(self.num_cells)
-        self.y_scratch = np.zeros(self.num_cells)
-        self.z_scratch = np.zeros(self.num_cells)
-        self.dx_scratch = np.zeros(self.num_cells)
+        self.turb_scratch = np.zeros((Turbulence.TURB_SCRATCH_SIZE, self.scratch_size))
+        self.turb_scratch[Turbulence.TURB_SCRATCH_RHO_INDEX] = np.zeros(self.scratch_size)
+        self.turb_scratch[Turbulence.TURB_SCRATCH_LN_RHO_INDEX] = np.zeros(self.scratch_size)
+        self.turb_scratch[Turbulence.TURB_SCRATCH_VEL_X_INDEX] = np.zeros(self.scratch_size)
+        self.turb_scratch[Turbulence.TURB_SCRATCH_VEL_Y_INDEX] = np.zeros(self.scratch_size)
+        self.turb_scratch[Turbulence.TURB_SCRATCH_VEL_Z_INDEX] = np.zeros(self.scratch_size)
+        self.turb_scratch[Turbulence.TURB_SCRATCH_MACH_INDEX] = np.zeros(self.scratch_size)
+
+        self.kernel_scratch = np.zeros(self.scratch_size)
+        self.distance_scratch = np.zeros((self.scratch_size, 3))
+
+        self.mean_cell_length_monitor = np.zeros(self.num_cells_processing)
+        self.std_cell_length_monitor = np.zeros(self.num_cells_processing)
+        self.turb_kernel_num_cells_monitor = np.zeros(self.num_cells_processing)
+        self.turb_kernel_radius_monitor = np.zeros(self.num_cells_processing)
+        self.center_weight_x_monitor = np.zeros(self.num_cells_processing)
+        self.center_weight_y_monitor = np.zeros(self.num_cells_processing)
+        self.center_weight_z_monitor = np.zeros(self.num_cells_processing)
+
+        self.x_scratch = np.zeros(self.scratch_size)
+        self.y_scratch = np.zeros(self.scratch_size)
+        self.z_scratch = np.zeros(self.scratch_size)
+        self.dx_scratch = np.zeros(self.scratch_size)
+
+        if self.rank == 0:
+            self.complete_dens_disp = np.zeros(self.num_cells)
+            self.complete_rms_turb_mach = np.zeros(self.num_cells)
+            self.complete_b = np.zeros(self.num_cells)
+            self.complete_turb_kernel_num_cells_monitor = np.zeros(self.num_cells)
+            self.complete_turb_kernel_radius_monitor = np.zeros(self.num_cells)
+            self.complete_mean_cell_length_monitor = np.zeros(self.num_cells)
+            self.complete_std_cell_length_monitor = np.zeros(self.num_cells)
+            self.complete_center_weight_x_monitor = np.zeros(self.num_cells)
+            self.complete_center_weight_y_monitor = np.zeros(self.num_cells)
+            self.complete_center_weight_z_monitor = np.zeros(self.num_cells)
+        else:
+            self.complete_dens_disp = None
+            self.complete_rms_turb_mach = None
+            self.complete_b = None
+            self.complete_turb_kernel_num_cells_monitor = None
+            self.complete_turb_kernel_radius_monitor = None
+            self.complete_mean_cell_length_monitor = None
+            self.complete_std_cell_length_monitor = None
+            self.complete_center_weight_x_monitor = None
+            self.complete_center_weight_y_monitor = None
+            self.complete_center_weight_z_monitor = None
 
     def fill_gaussian_kernel_scratch(self, center_index, kernel_indices, end, fwhm):
         numba_unstructured_gaussian_kernel(self.positions[kernel_indices], self.positions[center_index], 
@@ -136,13 +221,13 @@ class Turbulence:
         ln_rho_to_vel_z_slice = np.s_[Turbulence.LN_RHO_INDEX:Turbulence.VEL_Z_INDEX+1]
         for i in range(len(turb_kernel_indices)):
             center_index = turb_kernel_indices[i] 
-            smooth_kernel_indices = all_smooth_kernel_indices[i]  
+            smooth_kernel_indices = all_smooth_kernel_indices[i]
             end = len(smooth_kernel_indices)
 
             self.fill_gaussian_kernel_scratch(center_index, smooth_kernel_indices, end, fwhm)
 
-            np.einsum('ij,j->i', self.dataset[ln_rho_to_vel_z_slice, smooth_kernel_indices],
-                      self.kernel_scratch[:end], out=self.turb_scratch[ln_rho_to_vel_z_slice, i])
+            self.turb_scratch[ln_rho_to_vel_z_slice, i] = np.dot(self.dataset[ln_rho_to_vel_z_slice, smooth_kernel_indices], 
+                                                                self.kernel_scratch[:end])
 
     def fill_turb_scratch(self, kernel_indices, end):
         dataset_slice = np.s_[Turbulence.LN_RHO_INDEX:Turbulence.VEL_Z_INDEX+1]
@@ -170,10 +255,10 @@ class Turbulence:
             self.z_scratch[:end] = self.z[turb_kernel_indices]
             self.dx_scratch[:end] = self.dx[turb_kernel_indices]
 
-            self.turb_kernel_num_cells_monitor[index] = end
-            self.turb_kernel_radius_monitor[index] = turb_r
-            self.mean_cell_length_monitor[index] = np.mean(self.dx_scratch[:end])
-            self.std_cell_length_monitor[index] = np.std(self.dx_scratch[:end])
+            self.turb_kernel_num_cells_monitor[index - self.start] = end
+            self.turb_kernel_radius_monitor[index - self.start] = turb_r
+            self.mean_cell_length_monitor[index - self.start] = np.mean(self.dx_scratch[:end])
+            self.std_cell_length_monitor[index - self.start] = np.std(self.dx_scratch[:end])
 
             self.fill_smooth_scratch(turb_kernel_indices, turb_fwhm / 2)
 
@@ -187,9 +272,9 @@ class Turbulence:
 
             self.fill_gaussian_kernel_scratch(index, turb_kernel_indices, end, turb_fwhm)
 
-            self.center_weight_x_monitor[index] = self.x_scratch[:end].dot(self.kernel_scratch[:end])
-            self.center_weight_y_monitor[index] = self.y_scratch[:end].dot(self.kernel_scratch[:end])
-            self.center_weight_z_monitor[index] = self.z_scratch[:end].dot(self.kernel_scratch[:end])
+            self.center_weight_x_monitor[index - self.start] = self.x_scratch[:end].dot(self.kernel_scratch[:end])
+            self.center_weight_y_monitor[index - self.start] = self.y_scratch[:end].dot(self.kernel_scratch[:end])
+            self.center_weight_z_monitor[index - self.start] = self.z_scratch[:end].dot(self.kernel_scratch[:end])
 
             dens_disp = self.get_weighted_std(end, self.turb_scratch[Turbulence.TURB_SCRATCH_RHO_INDEX])
             rms_turb_mach = self.get_weighted_std(end, self.turb_scratch[Turbulence.TURB_SCRATCH_MACH_INDEX])
@@ -200,50 +285,72 @@ class Turbulence:
             dens_disp = np.nan
             rms_turb_mach = np.nan
             b = np.nan
-            self.turb_kernel_num_cells_monitor[index] = end
-            self.turb_kernel_radius_monitor[index] = np.nan
-            self.mean_cell_length_monitor[index] = np.nan
-            self.std_cell_length_monitor[index] = np.nan
-            self.center_weight_x_monitor[index] = np.nan
-            self.center_weight_y_monitor[index] = np.nan
-            self.center_weight_z_monitor[index] = np.nan
+            self.turb_kernel_num_cells_monitor[index - self.start] = end
+            self.turb_kernel_radius_monitor[index - self.start] = np.nan
+            self.mean_cell_length_monitor[index - self.start] = np.nan
+            self.std_cell_length_monitor[index - self.start] = np.nan
+            self.center_weight_x_monitor[index - self.start] = np.nan
+            self.center_weight_y_monitor[index - self.start] = np.nan
+            self.center_weight_z_monitor[index - self.start] = np.nan
 
         return dens_disp, rms_turb_mach, b
     
     def fill_turbulence_maps(self):
-        num_cells = self.positions.shape[0]
-        cells_per_proc = num_cells // self.size
-        start = self.rank * cells_per_proc
-        end = (self.rank + 1) * cells_per_proc if self.rank < self.size - 1 else num_cells
+        cells_per_proc = self.cells_per_proc
+        start = self.start
+        end = self.end
         print(f"Rank {self.rank} processing cells {start} to {end}")
-        start_t = time.time()
+        start_time = time.time()
         for i in tqdm(range(start, end), desc=f"Rank {self.rank}", position=self.rank):
-            self.dens_disp[i], self.rms_turb_mach[i], self.b[i] = self.get_turbulence_params(i)
-        end_t = time.time()
-        print(f"Rank {self.rank} finished processing cells {start} to {end} in {(end_t - start_t)/60:.2f} minutes")
+            local_index = i - start
+            self.dens_disp[local_index], self.rms_turb_mach[local_index], self.b[local_index] = self.get_turbulence_params(i)
+        end_time = time.time()
+        print(f"Rank {self.rank} finished processing cells {start} to {end} in {(end_time - start_time)/60:.2f} minutes")
+        self.shmcomm.Free()
 
         if self.comm is not None and self.size > 1:
             if self.rank == 0:
+                self.complete_dens_disp[start:end] = self.dens_disp[:]
+                self.complete_rms_turb_mach[start:end] = self.rms_turb_mach[:]
+                self.complete_b[start:end] = self.b[:]
+                self.complete_turb_kernel_num_cells_monitor[start:end] = self.turb_kernel_num_cells_monitor[:]
+                self.complete_turb_kernel_radius_monitor[start:end] = self.turb_kernel_radius_monitor[:]
+                self.complete_mean_cell_length_monitor[start:end] = self.mean_cell_length_monitor[:]
+                self.complete_std_cell_length_monitor[start:end] = self.std_cell_length_monitor[:]
+                self.complete_center_weight_x_monitor[start:end] = self.center_weight_x_monitor[:]
+                self.complete_center_weight_y_monitor[start:end] = self.center_weight_y_monitor[:]
+                self.complete_center_weight_z_monitor[start:end] = self.center_weight_z_monitor[:]
                 for i in range(1, self.size):
                     sl = np.s_[i * cells_per_proc: (i + 1) * cells_per_proc] if i < self.size - 1 else np.s_[i * cells_per_proc:]
-                    self.dens_disp[sl] = self.comm.recv(source=i, tag=0)
-                    self.rms_turb_mach[sl] = self.comm.recv(source=i, tag=1)
-                    self.b[sl] = self.comm.recv(source=i, tag=2)
-                    self.turb_kernel_num_cells_monitor[sl] = self.comm.recv(source=i, tag=3)
-                    self.turb_kernel_radius_monitor[sl] = self.comm.recv(source=i, tag=4)
-                    self.mean_cell_length_monitor[sl] = self.comm.recv(source=i, tag=5)
-                    self.std_cell_length_monitor[sl] = self.comm.recv(source=i, tag=6)
-                    self.center_weight_x_monitor[sl] = self.comm.recv(source=i, tag=7)
-                    self.center_weight_y_monitor[sl] = self.comm.recv(source=i, tag=8)
-                    self.center_weight_z_monitor[sl] = self.comm.recv(source=i, tag=9)
+                    self.complete_dens_disp[sl] = self.comm.recv(source=i, tag=0)
+                    self.complete_rms_turb_mach[sl] = self.comm.recv(source=i, tag=1)
+                    self.complete_b[sl] = self.comm.recv(source=i, tag=2)
+                    self.complete_turb_kernel_num_cells_monitor[sl] = self.comm.recv(source=i, tag=3)
+                    self.complete_turb_kernel_radius_monitor[sl] = self.comm.recv(source=i, tag=4)
+                    self.complete_mean_cell_length_monitor[sl] = self.comm.recv(source=i, tag=5)
+                    self.complete_std_cell_length_monitor[sl] = self.comm.recv(source=i, tag=6)
+                    self.complete_center_weight_x_monitor[sl] = self.comm.recv(source=i, tag=7)
+                    self.complete_center_weight_y_monitor[sl] = self.comm.recv(source=i, tag=8)
+                    self.complete_center_weight_z_monitor[sl] = self.comm.recv(source=i, tag=9)
             else:
-                self.comm.send(self.dens_disp[start:end], dest=0, tag=0)
-                self.comm.send(self.rms_turb_mach[start:end], dest=0, tag=1)
-                self.comm.send(self.b[start:end], dest=0, tag=2)
-                self.comm.send(self.turb_kernel_num_cells_monitor[start:end], dest=0, tag=3)
-                self.comm.send(self.turb_kernel_radius_monitor[start:end], dest=0, tag=4)
-                self.comm.send(self.mean_cell_length_monitor[start:end], dest=0, tag=5)
-                self.comm.send(self.std_cell_length_monitor[start:end], dest=0, tag=6)
-                self.comm.send(self.center_weight_x_monitor[start:end], dest=0, tag=7)
-                self.comm.send(self.center_weight_y_monitor[start:end], dest=0, tag=8)
-                self.comm.send(self.center_weight_z_monitor[start:end], dest=0, tag=9)
+                self.comm.send(self.dens_disp[:], dest=0, tag=0)
+                self.comm.send(self.rms_turb_mach[:], dest=0, tag=1)
+                self.comm.send(self.b[:], dest=0, tag=2)
+                self.comm.send(self.turb_kernel_num_cells_monitor[:], dest=0, tag=3)
+                self.comm.send(self.turb_kernel_radius_monitor[:], dest=0, tag=4)
+                self.comm.send(self.mean_cell_length_monitor[:], dest=0, tag=5)
+                self.comm.send(self.std_cell_length_monitor[:], dest=0, tag=6)
+                self.comm.send(self.center_weight_x_monitor[:], dest=0, tag=7)
+                self.comm.send(self.center_weight_y_monitor[:], dest=0, tag=8)
+                self.comm.send(self.center_weight_z_monitor[:], dest=0, tag=9)
+        else:
+            self.complete_dens_disp = self.dens_disp
+            self.complete_rms_turb_mach = self.rms_turb_mach
+            self.complete_b = self.b
+            self.complete_turb_kernel_num_cells_monitor = self.turb_kernel_num_cells_monitor
+            self.complete_turb_kernel_radius_monitor = self.turb_kernel_radius_monitor
+            self.complete_mean_cell_length_monitor = self.mean_cell_length_monitor
+            self.complete_std_cell_length_monitor = self.std_cell_length_monitor
+            self.complete_center_weight_x_monitor = self.center_weight_x_monitor
+            self.complete_center_weight_y_monitor = self.center_weight_y_monitor
+            self.complete_center_weight_z_monitor = self.center_weight_z_monitor
