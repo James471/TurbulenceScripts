@@ -1,5 +1,6 @@
 import os
 import yt
+yt.set_log_level(50)
 import numpy as np
 import matplotlib.pyplot as pl
 from scipy.optimize import curve_fit
