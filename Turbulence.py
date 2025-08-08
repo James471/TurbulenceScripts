@@ -59,6 +59,8 @@ class Turbulence:
             bins[i].append(idx)
             loads[i] += count
         self.load_balanced_order = np.concatenate(bins)
+        if self.load_balanced_order.size == 0:
+            self.load_balanced_order = np.arange(self._ad["x"].shape[0])
 
     def get_data(self, key, unit):
         if not hasattr(self, "load_balanced_order"):
