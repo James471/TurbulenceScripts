@@ -34,10 +34,10 @@ class Turbulence:
 
     MIN_CELLS_PER_TURB_KERNEL = 30
 
-    def update_load_balanced_order(self):
+    def get_load_balanced_order(self):
         if self.comm is None or self.size == 1:
-            self.load_balanced_order = np.arange(self._ad["x"].shape[0])
-            return
+            return np.arange(self._ad["x"].shape[0])
+        print("Acquiring positions...")
         x = self._ad["x"].to(self.length_unit).value
         y = self._ad["y"].to(self.length_unit).value
         z = self._ad["z"].to(self.length_unit).value
@@ -45,8 +45,10 @@ class Turbulence:
         dy = self._ad["dy"].to(self.length_unit).value
         dz = self._ad["dz"].to(self.length_unit).value
         positions = np.array([x, y, z]).T
+        print("Positions acquired, calculating neighbor lists...")
         tree = KDTree(positions)
         neighbor_lists = tree.query_ball_point(positions, 1.3 * self.turb_fwhm_factor * np.sqrt(dx**2 + dy**2 + dz**2))
+        print("Neighbor lists calculated, balancing load...")
         neighbor_counts = np.array([len(neighbors) for neighbors in neighbor_lists])
         items = list(enumerate(neighbor_counts))
         items.sort(key=lambda x: -x[1])
@@ -58,9 +60,11 @@ class Turbulence:
             i = np.argmin(loads)
             bins[i].append(idx)
             loads[i] += count
-        self.load_balanced_order = np.concatenate(bins)
-        if self.load_balanced_order.size == 0:
-            self.load_balanced_order = np.arange(self._ad["x"].shape[0])
+        load_balanced_order = np.concatenate(bins)
+        if load_balanced_order.size == 0:
+            load_balanced_order = np.arange(self._ad["x"].shape[0])
+        print("Load balancing complete.")
+        return load_balanced_order
 
     def get_data(self, key, unit):
         if not hasattr(self, "load_balanced_order"):
@@ -95,6 +99,12 @@ class Turbulence:
             self.shmcomm = self.comm.Split_type(MPI.COMM_TYPE_SHARED)
             self.rank = self.comm.Get_rank()
             self.size = self.comm.Get_size()
+            if self.rank == 0:
+                self.load_balanced_order = self.get_load_balanced_order()
+                self.comm.bcast(self.load_balanced_order, root=0)
+            else:
+                self.load_balanced_order = self.comm.bcast(None, root=0)
+            self.comm.barrier()
 
             N = self.get_data("x", self.length_unit).shape[0]
             itemsize = np.dtype(np.float64).itemsize
@@ -114,6 +124,7 @@ class Turbulence:
             self.shmcomm = None
             self.rank = 0
             self.size = 1
+            self.load_balanced_order = self.get_load_balanced_order()
             N = self._ad["x"].shape[0]
             shared_dataset = np.zeros((self.DATASET_SIZE, N), dtype=np.float64)
             shared_loc = np.zeros((self.SHARED_LOC_SIZE, N), dtype=np.float64)
@@ -150,9 +161,9 @@ class Turbulence:
         self.volume = shared_loc[Turbulence.VOLUME_INDEX]
 
         self.positions = shared_pos
-        self.tree = KDTree(self.positions)
-
         self.dataset = shared_dataset
+
+        self.tree = KDTree(self.positions)
 
         self.num_cells = self.x.shape[0]
         self.cells_per_proc = self.num_cells // self.size
