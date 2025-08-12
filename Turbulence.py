@@ -1,6 +1,6 @@
 import numpy as np
 from scipy.spatial import KDTree
-from util import numba_unstructured_gaussian_kernel, numba_weighted_std, numba_get_rho_by_rho0, numba_get_mach
+from util import numba_unstructured_gaussian_kernel, numba_weighted_std, numba_get_rho_by_rho0, numba_get_mach, numba_fill_smooth_scratch
 from mpi4py import MPI
 from tqdm import tqdm
 
@@ -231,16 +231,30 @@ class Turbulence:
     def fill_smooth_scratch(self, turb_kernel_indices, fwhm):
         r = 1.3 * fwhm
         all_smooth_kernel_indices = self.tree.query_ball_point(self.positions[turb_kernel_indices], r, return_sorted=False)
+        max_n = max(len(neigh) for neigh in all_smooth_kernel_indices)
+        ncenters = len(all_smooth_kernel_indices)
+        neighbors_arr = -np.ones((ncenters, max_n), dtype=np.int64)
+        neighbor_counts = np.empty(ncenters, dtype=np.int64)
+
+        for i, neigh in enumerate(all_smooth_kernel_indices):
+            count = len(neigh)
+            neighbor_counts[i] = count
+            neighbors_arr[i, :count] = neigh
+
         ln_rho_to_vel_z_slice = np.s_[Turbulence.LN_RHO_INDEX:Turbulence.VEL_Z_INDEX+1]
-        for i in range(len(turb_kernel_indices)):
-            center_index = turb_kernel_indices[i] 
-            smooth_kernel_indices = all_smooth_kernel_indices[i]
-            end = len(smooth_kernel_indices)
+        dataset_slice = self.dataset[ln_rho_to_vel_z_slice]
 
-            self.fill_gaussian_kernel_scratch(center_index, smooth_kernel_indices, end, fwhm)
-
-            self.turb_scratch[ln_rho_to_vel_z_slice, i] = np.dot(self.dataset[ln_rho_to_vel_z_slice, smooth_kernel_indices], 
-                                                                self.kernel_scratch[:end])
+        numba_fill_smooth_scratch(
+            np.array(turb_kernel_indices, dtype=np.int64),
+            neighbors_arr,
+            neighbor_counts,
+            self.positions,
+            self.volume,
+            dataset_slice,
+            fwhm,
+            self.kernel_scratch,
+            self.turb_scratch[ln_rho_to_vel_z_slice]
+        )
 
     def fill_turb_scratch(self, kernel_indices, end):
         dataset_slice = np.s_[Turbulence.LN_RHO_INDEX:Turbulence.VEL_Z_INDEX+1]

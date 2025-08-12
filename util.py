@@ -1,4 +1,5 @@
 from numba import njit, float64, void
+import numpy as np
 import math
 import os
 import re
@@ -19,6 +20,37 @@ def numba_unstructured_gaussian_kernel(positions, center, volumes, fwhm, out):
         norm += val
     for i in range(size):
         out[i] /= norm
+
+@njit
+def numba_fill_smooth_scratch(
+    turb_kernel_indices,
+    neighbors_arr,
+    neighbor_counts,
+    positions,
+    volume,
+    dataset_slice,
+    fwhm,
+    kernel_scratch,
+    turb_scratch
+):
+    ncenters = len(turb_kernel_indices)
+    for ci in range(ncenters):
+        center_index = turb_kernel_indices[ci]
+        end = neighbor_counts[ci]
+
+        numba_unstructured_gaussian_kernel(
+            positions[neighbors_arr[ci, :end]],
+            positions[center_index],
+            volume[neighbors_arr[ci, :end]],
+            fwhm,
+            kernel_scratch[:end]
+        )
+
+        for field_idx in range(dataset_slice.shape[0]):
+            s = 0.0
+            for ni in range(end):
+                s += dataset_slice[field_idx, neighbors_arr[ci, ni]] * kernel_scratch[ni]
+            turb_scratch[field_idx, ci] = s
 
 @njit(float64(float64[:], float64[:]))
 def numba_weighted_std(values, weights):
