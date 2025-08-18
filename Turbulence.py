@@ -290,14 +290,15 @@ class Turbulence:
             self.fill_smooth_scratch(turb_kernel_indices, turb_fwhm / 2)
 
             self.fill_turb_scratch(turb_kernel_indices, end)
+
+            self.fill_gaussian_kernel_scratch(index, turb_kernel_indices, end, turb_fwhm)
             
             sl = np.s_[0:end]
-            numba_get_rho_by_rho0(self.turb_scratch[Turbulence.LN_RHO_INDEX, sl], self.turb_scratch[Turbulence.TURB_SCRATCH_RHO_INDEX, sl])
+            numba_get_rho_by_rho0(self.turb_scratch[Turbulence.LN_RHO_INDEX, sl], self.kernel_scratch[sl], self.turb_scratch[Turbulence.TURB_SCRATCH_RHO_INDEX, sl])
             numba_get_mach(self.turb_scratch[Turbulence.TURB_SCRATCH_VEL_X_INDEX, sl], self.turb_scratch[Turbulence.TURB_SCRATCH_VEL_Y_INDEX, sl], 
                         self.turb_scratch[Turbulence.TURB_SCRATCH_VEL_Z_INDEX, sl], self.dataset[Turbulence.CS_INDEX, turb_kernel_indices], 
                         self.turb_scratch[Turbulence.TURB_SCRATCH_MACH_INDEX, sl])        
 
-            self.fill_gaussian_kernel_scratch(index, turb_kernel_indices, end, turb_fwhm)
 
             self.center_weight_x_monitor[index - self.start] = self.x_scratch[:end].dot(self.kernel_scratch[:end])
             self.center_weight_y_monitor[index - self.start] = self.y_scratch[:end].dot(self.kernel_scratch[:end])

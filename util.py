@@ -73,14 +73,13 @@ def numba_get_mach(velx, vely, velz, cs, mach):
         vel = math.sqrt(velx[i]**2 + vely[i]**2 + velz[i]**2)
         mach[i] = vel / cs[i]
 
-@njit(void(float64[:], float64[:]))
-def numba_get_rho_by_rho0(ln_rho, out):
+@njit(void(float64[:], float64[:], float64[:]))
+def numba_get_rho_by_rho0(ln_rho, gauss_weights, out):
     size = ln_rho.shape[0]
-    total_rho = 0.0
+    mean_rho = 0.0
     for i in range(size):
         out[i] = math.exp(ln_rho[i])
-        total_rho += out[i]
-    mean_rho = total_rho / size
+        mean_rho += gauss_weights[i] * out[i]
     for i in range(size):
         out[i] /= mean_rho
 
