@@ -20,7 +20,7 @@ class GalaxySnapshot:
 
     def do_everything(self, mass_fraction=0.9,
                       wnm_criteria=[f'obj["temperature_over_mu"] < {8e3/1.27}', f'obj["temperature_over_mu"] > {5e3/1.27}'],
-                      cnm_criteria=[f'obj["temperature_over_mu"] < {2e3}', f'obj["temperature_over_mu"] > {1e2}'],
+                      cnm_criteria=[f'obj["temperature_over_mu"] < {2e2/1.27}'],
                       max_zoom=50, 
                       diff_zoom=2,
                       framerate=5,
@@ -52,6 +52,7 @@ class GalaxySnapshot:
         table.field_names = ["Quantity", "Value"]
         table.add_row(["Max Level", max_level])
         table.add_row(["Smallest dx [pc]", f"{dx_min.to('pc').value:.2e}"])
+        table.add_row(["Current time", f"{self.ds.current_time.to('Gyr').value:.2f}"])
         table.add_row(["Gas Mass [Msun]", f"{self.gas_mass:.2e}"])
         table.add_row(["Particle Mass [Msun]", f"{self.particle_mass:.2e}"])
         table.add_row(["Star Mass [Msun]", f"{self.star_mass:.2e}"])
@@ -86,7 +87,7 @@ class GalaxySnapshot:
 
         table_cnm = PrettyTable()
         table_cnm.field_names = ["CNM Quantity", "Value"]
-        cnm_temp_min = float(cnm_criteria[1].split('>')[1].strip())
+        cnm_temp_min = 0
         cnm_temp_max = float(cnm_criteria[0].split('<')[1].strip())
         table_cnm.add_row(["CNM Temperature Range [K]", f"{cnm_temp_min:.0f} - {cnm_temp_max:.0f} (K)"])
         table_cnm.add_row(["Volume [kpc^3]", f"{cnm_info['CNM_volume'].to('kpc**3').value:.2f}"])
